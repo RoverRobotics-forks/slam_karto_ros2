@@ -25,7 +25,7 @@
 #endif // EIGEN_USE_NEW_STDVECTOR
 
 #define EIGEN_DEFAULT_IO_FORMAT Eigen::IOFormat(10)
-#include <Eigen/Eigen>
+#include <eigen3/Eigen/Eigen>
 
 #include <sparse_bundle_adjustment/spa2d.h>
 

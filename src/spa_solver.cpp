@@ -16,9 +16,8 @@
  */
 
 #include "spa_solver.h"
-#include <open_karto/Karto.h>
-
-#include "ros/console.h"
+#include "open_karto/Karto.h"
+#include "rclcpp/rclcpp.hpp"
 
 SpaSolver::SpaSolver()
 {
@@ -46,9 +45,10 @@ void SpaSolver::Compute()
 
   typedef std::vector<sba::Node2d, Eigen::aligned_allocator<sba::Node2d> > NodeVector;
 
-  ROS_INFO("Calling doSPA for loop closure");
+  auto logger = rclcpp::get_logger("SpaSolver");
+  RCLCPP_INFO(logger, "Calling doSPA for loop closure");
   m_Spa.doSPA(40);
-  ROS_INFO("Finished doSPA for loop closure");
+  RCLCPP_INFO(logger, "Finished doSPA for loop closure");
   NodeVector nodes = m_Spa.getNodes();
   forEach(NodeVector, &nodes)
   {
