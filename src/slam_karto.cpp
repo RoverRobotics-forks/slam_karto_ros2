@@ -26,15 +26,16 @@
 
 #include "rclcpp/rclcpp.hpp"
 //#include "ros/console.h"
+#include "geometry_msgs/msg/pose_stamped.hpp"
 #include "message_filters/subscriber.h"
+#include "nav_msgs/msg/map_meta_data.hpp"
+#include "nav_msgs/srv/get_map.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
+#include "tf2/utils.h"
 #include "tf2_ros/message_filter.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
 #include "visualization_msgs/msg/marker_array.hpp"
-
-#include "nav_msgs/msg/map_meta_data.hpp"
-#include "nav_msgs/srv/get_map.hpp"
-#include "sensor_msgs/msg/laser_scan.hpp"
 
 #include "open_karto/Mapper.h"
 
@@ -72,8 +73,9 @@ private:
 
   // ROS handles
   rclcpp::Node node_;
-  std::shared_ptr<tf2_ros::TransformListener> tf_;
-  tf2_ros::TransformBroadcaster * tfB_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener;
+  tf2_ros::TransformBroadcaster * tf_broadcaster;
   std::unique_ptr<message_filters::Subscriber<sensor_msgs::msg::LaserScan>> scan_filter_sub_;
   std::unique_ptr<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan>> scan_filter_;
 
@@ -137,7 +139,9 @@ SlamKarto::SlamKarto()
   double transform_publish_period = node_.declare_parameter("transform-publish_period", 0.05);
 
   // Set up publishers and subscriptions
-  tfB_ = new tf2_ros::TransformBroadcaster(node_);
+  tf_buffer = std::make_shared<tf2_ros::Buffer>(node_.get_clock());
+  tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
+  tf_broadcaster = new tf2_ros::TransformBroadcaster(node_);
   sst_ =
     node_.create_publisher<nav_msgs::msg::OccupancyGrid>("map", rclcpp::QoS(1).transient_local());
   sstm_ = node_.create_publisher<nav_msgs::msg::MapMetaData>(
@@ -147,7 +151,7 @@ SlamKarto::SlamKarto()
   scan_filter_sub_ = std::make_unique<message_filters::Subscriber<sensor_msgs::msg::LaserScan>>(
     node_, "scan", rclcpp::SensorDataQoS());
   scan_filter_ = std::make_unique<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan>>(
-    *scan_filter_sub_, tf_, odom_frame_, 5);
+    *scan_filter_sub_, tf_listener, odom_frame_, 5);
   scan_filter_->registerCallback([this](auto & c) { laserCallback(c); });
   // boost::bind(&SlamKarto::laserCallback, this, _1));
   marker_publisher_ =
@@ -286,7 +290,8 @@ SlamKarto::SlamKarto()
 
   // Set solver to be used in loop closure
   solver_ = std::make_unique<SpaSolver>();
-  mapper_->SetScanSolver(solver_.get());  // todo: this should be a shared_ptr
+  mapper_->SetScanSolver(
+    solver_.get());  // todo: this should be a shared_ptr, but we need mapper to be aware
 }
 
 SlamKarto::~SlamKarto()
@@ -300,7 +305,7 @@ SlamKarto::~SlamKarto()
   solver_.reset();
   solver_.reset();
   mapper_.reset();
-  dataset_.release();
+  dataset_.reset();
   // TODO: delete the pointers in the lasers_ map; not sure whether or not
   // I'm supposed to do that.
 }
@@ -325,7 +330,7 @@ void SlamKarto::publishTransform()
   msg.header.stamp = node_.now();
   msg.child_frame_id = odom_frame_;
   tf2::fromMsg(map_to_odom_, msg.transform);
-  tfB_->sendTransform(msg);
+  tf_broadcaster->sendTransform(msg);
 }
 
 karto::LaserRangeFinder * SlamKarto::getLaser(const sensor_msgs::msg::LaserScan::ConstPtr & scan)
@@ -334,50 +339,49 @@ karto::LaserRangeFinder * SlamKarto::getLaser(const sensor_msgs::msg::LaserScan:
   if (lasers_.find(scan->header.frame_id) == lasers_.end()) {
     // New laser; need to create a Karto device for it.
 
-    // Get the laser's pose, relative to base.
-    tf::Stamped<tf::Pose> ident;
-    tf::Stamped<tf::Transform> laser_pose;
-    ident.setIdentity();
-    ident.frame_id_ = scan->header.frame_id;
-    ident.stamp_ = scan->header.stamp;
+    geometry_msgs::msg::Pose laser_pose;
     try {
+      // Get the laser's pose, relative to base.
+      geometry_msgs::msg::PoseStamped ident;
+      ident.header = scan->header;
 
-      tf_.transformPose(base_frame_, ident, laser_pose);
-    } catch (tf::TransformException e) {
-      ROS_WARN("Failed to compute laser pose, aborting initialization (%s)", e.what());
+      laser_pose = tf_buffer->transform(ident, "base_frame").pose;
+
+    } catch (tf2::TransformException & e) {
+      RCLCPP_WARN(
+        node_.get_logger(), "Failed to compute laser pose, aborting initialization (%s)", e.what());
       return nullptr;
     }
+    double yaw = tf2::getYaw(laser_pose.orientation);
 
-    double yaw = tf::getYaw(laser_pose.getRotation());
-
-    RCLCPP_INFO(node_.get_logger(),
-      "laser %s's pose wrt base: %.3f %.3f %.3f", scan->header.frame_id.c_str(),
-      laser_pose.getOrigin().x(), laser_pose.getOrigin().y(), yaw);
+    RCLCPP_INFO(
+      node_.get_logger(), "laser %s's pose wrt base: %.3f %.3f %.3f", scan->header.frame_id.c_str(),
+      laser_pose.position.x, laser_pose.position.y, yaw);
     // To account for lasers that are mounted upside-down,
     // we create a point 1m above the laser and transform it into the laser frame
     // if the point's z-value is <=0, it is upside-down
 
-    tf::Vector3 v;
-    v.setValue(0, 0, 1 + laser_pose.getOrigin().z());
-    tf::Stamped<tf::Vector3> up(v, scan->header.stamp, base_frame_);
+    tf2::Vector3 v(0, 0, 1 + laser_pose.position.z);
+
+    tf2::Stamped<tf2::Vector3> up(v, tf2_ros::fromMsg(scan->header.stamp), base_frame_);
 
     try {
-      tf_.transformPoint(scan->header.frame_id, up, up);
-      ROS_DEBUG("Z-Axis in sensor frame: %.3f", up.z());
-    } catch (tf::TransformException & e) {
-      ROS_WARN("Unable to determine orientation of laser: %s", e.what());
+      tf_buffer->transform(up, up, scan->header.frame_id);
+      RCLCPP_DEBUG(node_.get_logger(), "Z-Axis in sensor frame: %.3f", up.z());
+    } catch (tf2::TransformException & e) {
+      RCLCPP_WARN(node_.get_logger(), "Unable to determine orientation of laser: %s", e.what());
       return nullptr;
     }
 
     bool inverse = lasers_inverted_[scan->header.frame_id] = up.z() <= 0;
-    if (inverse) ROS_INFO("laser is mounted upside-down");
+    if (inverse) RCLCPP_DEBUG(node_.get_logger(), "laser is mounted upside-down");
 
     // Create a laser range finder device and copy in data from the first
     // scan
     std::string name = scan->header.frame_id;
     karto::LaserRangeFinder * laser = karto::LaserRangeFinder::CreateLaserRangeFinder(
       karto::LaserRangeFinder_Custom, karto::Name(name));
-    laser->SetOffsetPose(karto::Pose2(laser_pose.getOrigin().x(), laser_pose.getOrigin().y(), yaw));
+    laser->SetOffsetPose(karto::Pose2(laser_pose.position.x, laser_pose.position.y, yaw));
     laser->SetMinimumRange(scan->range_min);
     laser->SetMaximumRange(scan->range_max);
     laser->SetMinimumAngle(scan->angle_min);
@@ -399,16 +403,16 @@ karto::LaserRangeFinder * SlamKarto::getLaser(const sensor_msgs::msg::LaserScan:
 bool SlamKarto::getOdomPose(karto::Pose2 & karto_pose, const rclcpp::Time & t)
 {
   // Get the robot's pose
-  tf::Stamped<tf::Pose> ident(
-    tf::Transform(tf::createQuaternionFromRPY(0, 0, 0), tf::Vector3(0, 0, 0)), t, base_frame_);
-  tf::Stamped<tf::Transform> odom_pose;
+  tf2::Stamped<tf2::Transform> odom_pose;
+  odom_pose.setData(tf2::Transform::getIdentity());
+  odom_pose.frame_id_ = odom_frame_;  // todo: what frame is this coming from?
   try {
-    tf_.transformPose(odom_frame_, ident, odom_pose);
-  } catch (tf::TransformException e) {
-    RCLCPP_WARN(node_.get_logger(),"Failed to compute odom pose, skipping scan (%s)", e.what());
+    tf_buffer->transform(odom_pose, odom_pose, odom_frame_);
+  } catch (tf2::TransformException & e) {
+    RCLCPP_WARN(node_.get_logger(), "Failed to compute odom pose, skipping scan (%s)", e.what());
     return false;
   }
-  double yaw = tf::getYaw(odom_pose.getRotation());
+  double yaw = tf2::getYaw(odom_pose.getRotation());
 
   karto_pose = karto::Pose2(odom_pose.getOrigin().x(), odom_pose.getOrigin().y(), yaw);
   return true;
@@ -606,13 +610,11 @@ bool SlamKarto::addScan(
   std::vector<kt_double> readings;
 
   if (lasers_inverted_[scan->header.frame_id]) {
-    for (std::vector<float>::const_reverse_iterator it = scan->ranges.rbegin();
-         it != scan->ranges.rend(); ++it) {
+    for (auto it = scan->ranges.rbegin(); it != scan->ranges.rend(); ++it) {
       readings.push_back(*it);
     }
   } else {
-    for (std::vector<float>::const_iterator it = scan->ranges.begin(); it != scan->ranges.end();
-         ++it) {
+    for (auto it = scan->ranges.begin(); it != scan->ranges.end(); ++it) {
       readings.push_back(*it);
     }
   }
