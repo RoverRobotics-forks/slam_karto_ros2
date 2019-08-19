@@ -1,5 +1,5 @@
 /*
- * slam_karto
+ * Copyright 2019, Rover Robotics
  * Copyright (c) 2008, Willow Garage, Inc.
  *
  * THE WORK (AS DEFINED BELOW) IS PROVIDED UNDER THE TERMS OF THIS CREATIVE
@@ -627,32 +627,27 @@ bool SlamKarto::addScan(
   // Add the localized range scan to the mapper
   bool processed;
   if ((processed = mapper_->Process(range_scan))) {
-    // std::cout << "Pose: " << range_scan->GetOdometricPose() << " Corrected Pose: " <<
-    // range_scan->GetCorrectedPose() << std::endl;
-
     karto::Pose2 corrected_pose = range_scan->GetCorrectedPose();
 
+    tf2::Stamped<tf2::Transform> map_to_base;
+    tf2::Quaternion rot;
+    rot.setRPY(0,0, corrected_pose.GetHeading());
+    map_to_base.setRotation(rot);
+    map_to_base.setOrigin({corrected_pose.GetX(),corrected_pose.GetY(),0.0});
+    tf2::fromMsg(scan->header.stamp, map_to_base.stamp_);
+    map_to_base.frame_id_ = map_frame_;
+
     // Compute the map->odom transform
-    tf::Stamped<tf::Pose> odom_to_map;
+    tf2::Transform base_to_odom;
     try {
-      tf_.transformPose(
-        odom_frame_,
-        tf::Stamped<tf::Pose>(
-          tf::Transform(
-            tf::createQuaternionFromRPY(0, 0, corrected_pose.GetHeading()),
-            tf::Vector3(corrected_pose.GetX(), corrected_pose.GetY(), 0.0))
-            .inverse(),
-          scan->header.stamp, base_frame_),
-        odom_to_map);
-    } catch (tf::TransformException e) {
+      auto base_to_odom_msg = tf_buffer->lookupTransform(base_frame_, odom_frame_, tf2_ros::fromMsg(scan->header.stamp));
+      tf2::fromMsg(base_to_odom_msg.transform, base_to_odom);
+    } catch (tf2::TransformException &e) {
       RCLCPP_ERROR(node_.get_logger(), "Transform from base_link to odom failed\n");
-      odom_to_map.setIdentity();
     }
 
     map_to_odom_mutex_.lock();
-    map_to_odom_ =
-      tf::Transform(tf::Quaternion(odom_to_map.getRotation()), tf::Point(odom_to_map.getOrigin()))
-        .inverse();
+    map_to_odom_ = base_to_odom * map_to_base;
     map_to_odom_mutex_.unlock();
 
     // Add the localized range scan to the dataset (for memory management)
