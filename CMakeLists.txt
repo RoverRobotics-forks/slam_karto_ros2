@@ -34,6 +34,7 @@ ament_target_dependencies(slam_karto
   tf2_ros
   visualization_msgs
   )
+
 #target_link_libraries(slam_karto sparse_bundle_adjustment::sba)
 install(
   TARGETS slam_karto

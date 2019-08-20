@@ -25,12 +25,11 @@
 */
 
 #include <map>
-#include <string>
-#include <vector>
-#include <thread>
 #include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
 
-#include "tf2_geometry_msgs/tf2_geometry_msgs.h"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "message_filters/subscriber.h"
 #include "nav_msgs/msg/map_meta_data.hpp"
@@ -38,6 +37,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2/utils.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.h"
 #include "tf2_ros/message_filter.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
@@ -93,7 +93,7 @@ private:
   int throttle_scans_;
   rclcpp::Duration map_update_interval_{0};
   double resolution_;
-  std::mutex  map_mutex_;
+  std::mutex map_mutex_;
   std::mutex map_to_odom_mutex_;
 
   // Karto bookkeeping
@@ -164,7 +164,7 @@ SlamKarto::SlamKarto()
   // transform; it needs to go out regularly, uninterrupted by potentially
   // long periods of computation in our main loop.
   transform_thread_ =
-    new std::thread([this, transform_publish_period](){publishLoop(transform_publish_period);});
+    new std::thread([this, transform_publish_period]() { publishLoop(transform_publish_period); });
 
   // Initialize Karto structures
   mapper_ = std::make_unique<karto::Mapper>();
@@ -341,49 +341,35 @@ karto::LaserRangeFinder * SlamKarto::getLaser(const sensor_msgs::msg::LaserScan 
   if (lasers_.find(scan.header.frame_id) == lasers_.end()) {
     // New laser; need to create a Karto device for it.
 
-    geometry_msgs::msg::Pose laser_pose;
+    tf2::Transform laser_pose;
     try {
       // Get the laser's pose, relative to base.
-      geometry_msgs::msg::PoseStamped ident;
-      ident.header = scan.header;
-
-      laser_pose = tf_buffer->transform(ident, "base_frame").pose;
-
+      auto lpmsg = tf_buffer->lookupTransform(
+        scan.header.frame_id, base_frame_, tf2_ros::fromMsg(scan.header.stamp));
+      tf2::fromMsg(lpmsg.transform, laser_pose);
     } catch (tf2::TransformException & e) {
       RCLCPP_WARN(
         node_.get_logger(), "Failed to compute laser pose, aborting initialization (%s)", e.what());
       return nullptr;
     }
-    double yaw = tf2::getYaw(laser_pose.orientation);
+    double yaw = tf2::getYaw(laser_pose.getRotation());
 
     RCLCPP_INFO(
       node_.get_logger(), "laser %s's pose wrt base: %.3f %.3f %.3f", scan.header.frame_id.c_str(),
-      laser_pose.position.x, laser_pose.position.y, yaw);
-    // To account for lasers that are mounted upside-down,
-    // we create a point 1m above the laser and transform it into the laser frame
-    // if the point's z-value is <=0, it is upside-down
+      laser_pose.getOrigin().x(), laser_pose.getOrigin().y(), yaw);
 
-    tf2::Vector3 v(0, 0, 1 + laser_pose.position.z);
+    // Determine if laser is mounted upside-down
+    auto laser_up = tf2::quatRotate(laser_pose.getRotation(), {0, 0, 1});
 
-    tf2::Stamped<tf2::Vector3> up(v, tf2_ros::fromMsg(scan.header.stamp), base_frame_);
-
-    try {
-      up = tf_buffer->transform(up, scan.header.frame_id);
-      RCLCPP_DEBUG(node_.get_logger(), "Z-Axis in sensor frame: %.3f", up.z());
-    } catch (tf2::TransformException & e) {
-      RCLCPP_WARN(node_.get_logger(), "Unable to determine orientation of laser: %s", e.what());
-      return nullptr;
-    }
-
-    bool inverse = lasers_inverted_[scan.header.frame_id] = up.z() <= 0;
+    RCLCPP_DEBUG(node_.get_logger(), "Z-Axis in sensor frame: %.3f", laser_up.z());
+    bool inverse = lasers_inverted_[scan.header.frame_id] = (laser_up.z() <= 0.0);
     if (inverse) RCLCPP_DEBUG(node_.get_logger(), "laser is mounted upside-down");
 
-    // Create a laser range finder device and copy in data from the first
-    // scan
+    // Create a laser range finder device and copy in data from the first scan
     std::string name = scan.header.frame_id;
     karto::LaserRangeFinder * laser = karto::LaserRangeFinder::CreateLaserRangeFinder(
       karto::LaserRangeFinder_Custom, karto::Name(name));
-    laser->SetOffsetPose(karto::Pose2(laser_pose.position.x, laser_pose.position.y, yaw));
+    laser->SetOffsetPose(karto::Pose2(laser_pose.getOrigin().x(), laser_pose.getOrigin().y(), yaw));
     laser->SetMinimumRange(scan.range_min);
     laser->SetMaximumRange(scan.range_max);
     laser->SetMinimumAngle(scan.angle_min);
@@ -405,19 +391,18 @@ karto::LaserRangeFinder * SlamKarto::getLaser(const sensor_msgs::msg::LaserScan 
 bool SlamKarto::getOdomPose(karto::Pose2 & karto_pose, const rclcpp::Time & t)
 {
   // Get the robot's pose
-  tf2::Stamped<tf2::Transform> odom_pose;
-  odom_pose.setData(tf2::Transform::getIdentity());
-  odom_pose.frame_id_ = base_frame_;
-  odom_pose.stamp_ = tf2_ros::fromMsg(t);
+  geometry_msgs::msg::PoseStamped odom_pose;
+  odom_pose.header.stamp = t;
+  odom_pose.header.frame_id = base_frame_;
   try {
     odom_pose = tf_buffer->transform(odom_pose, odom_frame_);
   } catch (tf2::TransformException & e) {
     RCLCPP_WARN(node_.get_logger(), "Failed to compute odom pose, skipping scan (%s)", e.what());
     return false;
   }
-  double yaw = tf2::getYaw(odom_pose.getRotation());
+  double yaw = tf2::getYaw(odom_pose.pose.orientation);
 
-  karto_pose = karto::Pose2(odom_pose.getOrigin().x(), odom_pose.getOrigin().y(), yaw);
+  karto_pose = karto::Pose2(odom_pose.pose.position.x, odom_pose.pose.position.y, yaw);
   return true;
 }
 
@@ -451,6 +436,7 @@ void SlamKarto::publishGraphVisualization()
   edge.header.stamp = node_.now();
   edge.action = visualization_msgs::msg::Marker::ADD;
   edge.ns = "karto";
+  edge.id = 0;
   edge.id = 0;
   edge.type = visualization_msgs::msg::Marker::LINE_STRIP;
   edge.scale.x = 0.1;
