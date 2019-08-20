@@ -24,12 +24,18 @@
 
 */
 
-#include "rclcpp/rclcpp.hpp"
-//#include "ros/console.h"
+#include <map>
+#include <string>
+#include <vector>
+#include <thread>
+#include <mutex>
+
+#include "tf2_geometry_msgs/tf2_geometry_msgs.h"
 #include "geometry_msgs/msg/pose_stamped.hpp"
 #include "message_filters/subscriber.h"
 #include "nav_msgs/msg/map_meta_data.hpp"
 #include "nav_msgs/srv/get_map.hpp"
+#include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2/utils.h"
 #include "tf2_ros/message_filter.h"
@@ -38,14 +44,7 @@
 #include "visualization_msgs/msg/marker_array.hpp"
 
 #include "open_karto/Mapper.h"
-
 #include "spa_solver.h"
-
-#include <boost/thread.hpp>
-
-#include <map>
-#include <string>
-#include <vector>
 
 // compute linear index for given map coords
 #define MAP_IDX(sx, i, j) ((sx) * (j) + (i))
@@ -94,8 +93,8 @@ private:
   int throttle_scans_;
   rclcpp::Duration map_update_interval_{0};
   double resolution_;
-  boost::mutex map_mutex_;
-  boost::mutex map_to_odom_mutex_;
+  std::mutex  map_mutex_;
+  std::mutex map_to_odom_mutex_;
 
   // Karto bookkeeping
   std::unique_ptr<karto::Mapper> mapper_;
@@ -107,7 +106,7 @@ private:
   // Internal state
   bool got_map_;
   int laser_count_;
-  boost::thread * transform_thread_;
+  std::thread * transform_thread_;
   tf2::Transform map_to_odom_;
   unsigned marker_count_;
   bool inverted_laser_;
@@ -128,7 +127,7 @@ SlamKarto::SlamKarto()
   base_frame_ = node_.declare_parameter("base_frame", "base_link");
   throttle_scans_ = node_.declare_parameter("throttle_scans", 1);
   map_update_interval_ =
-    rclcpp::Duration::from_seconds(node_.declare_parameter("map_update_interval", 5.0));
+    std::chrono::duration<double>(node_.declare_parameter("map_update_interval", 5.0));
 
   if (!node_.get_parameter("resolution", resolution_)) {
     // Compatibility with slam_gmapping, which uses "delta" to mean
@@ -147,13 +146,17 @@ SlamKarto::SlamKarto()
   sstm_ = node_.create_publisher<nav_msgs::msg::MapMetaData>(
     "map_metadata", rclcpp::QoS(1).transient_local());
   ss_ = node_.create_service<nav_msgs::srv::GetMap>(
-    "dynamic_map", [this](auto x, auto y) { mapCallback(x, y); });
+    "dynamic_map", [this](
+                     const nav_msgs::srv::GetMap::Request::SharedPtr x,
+                     nav_msgs::srv::GetMap::Response::SharedPtr y) { mapCallback(*x, *y); });
+
   scan_filter_sub_ = std::make_unique<message_filters::Subscriber<sensor_msgs::msg::LaserScan>>(
-    node_, "scan", rclcpp::SensorDataQoS());
+    &node_, "scan", rmw_qos_profile_sensor_data);
   scan_filter_ = std::make_unique<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan>>(
-    *scan_filter_sub_, tf_listener, odom_frame_, 5);
-  scan_filter_->registerCallback([this](auto & c) { laserCallback(c); });
-  // boost::bind(&SlamKarto::laserCallback, this, _1));
+    *scan_filter_sub_, *tf_buffer, odom_frame_, 5, node_.get_node_logging_interface(),
+    node_.get_node_clock_interface());
+  ;
+  scan_filter_->registerCallback([this](auto & c) { laserCallback(*c); });
   marker_publisher_ =
     node_.create_publisher<visualization_msgs::msg::MarkerArray>("visualization_marker_array", 1);
 
@@ -161,12 +164,11 @@ SlamKarto::SlamKarto()
   // transform; it needs to go out regularly, uninterrupted by potentially
   // long periods of computation in our main loop.
   transform_thread_ =
-    new boost::thread(boost::bind(&SlamKarto::publishLoop, this, transform_publish_period));
+    new std::thread([this, transform_publish_period](){publishLoop(transform_publish_period);});
 
   // Initialize Karto structures
   mapper_ = std::make_unique<karto::Mapper>();
   dataset_ = std::make_unique<karto::Dataset>();
-
   // Setting General Parameters from the Parameter Server
   bool use_scan_matching;
   if (node_.get_parameter("use_scan_matching", use_scan_matching))
@@ -323,13 +325,13 @@ void SlamKarto::publishLoop(double transform_publish_period)
 
 void SlamKarto::publishTransform()
 {
-  boost::mutex::scoped_lock lock(map_to_odom_mutex_);
-  rclcpp::Time tf_expiration = node_.now() + rclcpp::Duration::from_seconds(.05);
+  std::lock_guard<std::mutex> lock(map_to_odom_mutex_);
+  rclcpp::Time tf_expiration = node_.now() + std::chrono::duration<double>(0.05);
   geometry_msgs::msg::TransformStamped msg;
   msg.header.frame_id = map_frame_;
   msg.header.stamp = node_.now();
   msg.child_frame_id = odom_frame_;
-  tf2::fromMsg(map_to_odom_, msg.transform);
+  msg.transform = tf2::toMsg(map_to_odom_);
   tf_broadcaster->sendTransform(msg);
 }
 
@@ -366,7 +368,7 @@ karto::LaserRangeFinder * SlamKarto::getLaser(const sensor_msgs::msg::LaserScan 
     tf2::Stamped<tf2::Vector3> up(v, tf2_ros::fromMsg(scan.header.stamp), base_frame_);
 
     try {
-      tf_buffer->transform(up, up, scan.header.frame_id);
+      up = tf_buffer->transform(up, scan.header.frame_id);
       RCLCPP_DEBUG(node_.get_logger(), "Z-Axis in sensor frame: %.3f", up.z());
     } catch (tf2::TransformException & e) {
       RCLCPP_WARN(node_.get_logger(), "Unable to determine orientation of laser: %s", e.what());
@@ -405,9 +407,10 @@ bool SlamKarto::getOdomPose(karto::Pose2 & karto_pose, const rclcpp::Time & t)
   // Get the robot's pose
   tf2::Stamped<tf2::Transform> odom_pose;
   odom_pose.setData(tf2::Transform::getIdentity());
-  odom_pose.frame_id_ = odom_frame_;  // todo: what frame is this coming from?
+  odom_pose.frame_id_ = base_frame_;
+  odom_pose.stamp_ = tf2_ros::fromMsg(t);
   try {
-    tf_buffer->transform(odom_pose, odom_pose, odom_frame_);
+    odom_pose = tf_buffer->transform(odom_pose, odom_frame_);
   } catch (tf2::TransformException & e) {
     RCLCPP_WARN(node_.get_logger(), "Failed to compute odom pose, skipping scan (%s)", e.what());
     return false;
@@ -532,7 +535,7 @@ void SlamKarto::laserCallback(const sensor_msgs::msg::LaserScan & scan)
 
 bool SlamKarto::updateMap()
 {
-  boost::mutex::scoped_lock lock(map_mutex_);
+  std::lock_guard<std::mutex> lock(map_mutex_);
 
   karto::OccupancyGrid * occ_grid =
     karto::OccupancyGrid::CreateFromScans(mapper_->GetAllProcessedScans(), resolution_);
@@ -631,18 +634,19 @@ bool SlamKarto::addScan(
 
     tf2::Stamped<tf2::Transform> map_to_base;
     tf2::Quaternion rot;
-    rot.setRPY(0,0, corrected_pose.GetHeading());
+    rot.setRPY(0, 0, corrected_pose.GetHeading());
     map_to_base.setRotation(rot);
-    map_to_base.setOrigin({corrected_pose.GetX(),corrected_pose.GetY(),0.0});
-    tf2::fromMsg(scan.header.stamp, map_to_base.stamp_);
+    map_to_base.setOrigin({corrected_pose.GetX(), corrected_pose.GetY(), 0.0});
+    map_to_base.stamp_ = tf2_ros::fromMsg(scan.header.stamp);
     map_to_base.frame_id_ = map_frame_;
 
     // Compute the map->odom transform
     tf2::Transform base_to_odom;
     try {
-      auto base_to_odom_msg = tf_buffer->lookupTransform(base_frame_, odom_frame_, tf2_ros::fromMsg(scan.header.stamp));
+      auto base_to_odom_msg =
+        tf_buffer->lookupTransform(base_frame_, odom_frame_, tf2_ros::fromMsg(scan.header.stamp));
       tf2::fromMsg(base_to_odom_msg.transform, base_to_odom);
-    } catch (tf2::TransformException &e) {
+    } catch (tf2::TransformException & e) {
       RCLCPP_ERROR(node_.get_logger(), "Transform from base_link to odom failed\n");
     }
 
@@ -661,7 +665,7 @@ bool SlamKarto::addScan(
 bool SlamKarto::mapCallback(
   nav_msgs::srv::GetMap::Request & req, nav_msgs::srv::GetMap::Response & res)
 {
-  boost::mutex::scoped_lock lock(map_mutex_);
+  std::lock_guard<std::mutex> lock(map_mutex_);
   if (got_map_ && map_.map.info.width && map_.map.info.height) {
     res = map_;
     return true;
