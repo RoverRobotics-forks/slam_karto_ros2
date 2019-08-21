@@ -12,6 +12,7 @@ find_package(ament_cmake REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(open_karto REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(message_filters REQUIRED) # workaround to https://github.com/ros2/geometry2/pull/135
 find_package(sensor_msgs REQUIRED)
 find_package(sparse_bundle_adjustment REQUIRED)
 find_package(tf2 REQUIRED)
@@ -21,6 +22,7 @@ find_package(visualization_msgs REQUIRED)
 find_package(Boost REQUIRED COMPONENTS thread) # < this should be pulled in from open_karto. Not sure why it's not
 
 add_executable(slam_karto src/slam_karto.cpp src/spa_solver.cpp)
+
 ament_target_dependencies(slam_karto
   Boost # < this should be pulled in from open_karto. Not sure why it's not
   Eigen3
@@ -29,13 +31,12 @@ ament_target_dependencies(slam_karto
   nav_msgs
   sensor_msgs
   sparse_bundle_adjustment
+  message_filters # workaround to https://github.com/ros2/geometry2/pull/135
   tf2
   tf2_geometry_msgs
   tf2_ros
   visualization_msgs
   )
-
-#target_link_libraries(slam_karto sparse_bundle_adjustment::sba)
 install(
   TARGETS slam_karto
   LIBRARY DESTINATION lib

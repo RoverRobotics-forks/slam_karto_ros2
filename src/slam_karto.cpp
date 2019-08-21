@@ -135,7 +135,7 @@ SlamKarto::SlamKarto()
     node_.get_parameter_or("delta", resolution_, 0.05);
   }
 
-  double transform_publish_period = node_.declare_parameter("transform-publish_period", 0.05);
+  double transform_publish_period = node_.declare_parameter("transform_publish_period", 0.05);
 
   // Set up publishers and subscriptions
   tf_buffer = std::make_shared<tf2_ros::Buffer>(node_.get_clock());
@@ -155,8 +155,12 @@ SlamKarto::SlamKarto()
   scan_filter_ = std::make_unique<tf2_ros::MessageFilter<sensor_msgs::msg::LaserScan>>(
     *scan_filter_sub_, *tf_buffer, odom_frame_, 5, node_.get_node_logging_interface(),
     node_.get_node_clock_interface());
-  ;
-  scan_filter_->registerCallback([this](auto & c) { laserCallback(*c); });
+
+  auto cb2 = [this](const message_filters::MessageEvent<sensor_msgs::msg::LaserScan const> & ev) {
+    laserCallback(*ev.getConstMessage());
+  };
+  message_filters::Connection con = scan_filter_->registerCallback(cb2);
+
   marker_publisher_ =
     node_.create_publisher<visualization_msgs::msg::MarkerArray>("visualization_marker_array", 1);
 
