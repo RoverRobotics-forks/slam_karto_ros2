@@ -39,8 +39,7 @@ ament_target_dependencies(slam_karto
   )
 install(
   TARGETS slam_karto
-  LIBRARY DESTINATION lib
-  RUNTIME DESTINATION bin
+  DESTINATION lib/${PROJECT_NAME}
   )
 
 ament_package()
