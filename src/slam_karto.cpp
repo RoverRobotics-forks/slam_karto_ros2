@@ -38,6 +38,7 @@
 #include "sensor_msgs/msg/laser_scan.hpp"
 #include "tf2/utils.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.h"
+#include "tf2_ros/create_timer_ros.h"
 #include "tf2_ros/message_filter.h"
 #include "tf2_ros/transform_broadcaster.h"
 #include "tf2_ros/transform_listener.h"
@@ -139,6 +140,8 @@ SlamKarto::SlamKarto()
 
   // Set up publishers and subscriptions
   tf_buffer = std::make_shared<tf2_ros::Buffer>(node_.get_clock());
+  tf_buffer->setCreateTimerInterface(std::make_shared<tf2_ros::CreateTimerROS>(
+    node_.get_node_base_interface(), node_.get_node_timers_interface()));
   tf_listener = std::make_shared<tf2_ros::TransformListener>(*tf_buffer);
   tf_broadcaster = new tf2_ros::TransformBroadcaster(node_);
   sst_ =
